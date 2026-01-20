@@ -1,0 +1,11 @@
+{
+  "name": "vercel",
+  "main": "index.ts",
+  "devDependencies": {
+    "@types/node": "^20"
+  },
+  "dependencies": {
+    "@pulumi/pulumi": "^3",
+    "@pulumiverse/vercel": "^1"
+  }
+}

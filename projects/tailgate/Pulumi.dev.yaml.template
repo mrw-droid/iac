@@ -1,0 +1,19 @@
+config:
+  # Your Tailscale tailnet name
+  # Can be just the name (e.g., "myname") or full domain (e.g., "myname.ts.net")
+  tailgate:tailnetName: "your-tailnet-name"
+
+  # Optional: GCP zone (default: us-central1-a, which is free tier eligible)
+  # tailgate:zone: "us-central1-a"
+
+  # Optional: hostname for the Tailscale device (default: admin)
+  # tailgate:hostname: "admin"
+
+  # GCP provider configuration
+  gcp:project: "your-gcp-project-id"
+  gcp:region: "us-central1"
+
+  # Tailscale provider configuration
+  # Set via: pulumi config set --secret tailscale:apiKey "tskey-api-..."
+  tailscale:apiKey: ""
+  tailscale:tailnet: "your-tailnet-name"
