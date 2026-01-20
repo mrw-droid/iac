@@ -1,0 +1,18 @@
+config:
+  # MongoDB Atlas Organization ID (found in Atlas UI: Organization Settings)
+  mongodb:atlasOrgId: "your-atlas-org-id"
+
+  # Database password (will be encrypted)
+  # mongodb:atlasDbPassword:
+  #   secure: <encrypted-value>
+
+  # Optional: customize database name (default: website)
+  # mongodb:dbName: "website"
+
+  # Optional: customize database username (default: appuser)
+  # mongodb:dbUsername: "appuser"
+
+  # MongoDB Atlas provider configuration
+  # These are set via pulumi config set --secret
+  mongodbatlas:publicKey: ""
+  mongodbatlas:privateKey: ""

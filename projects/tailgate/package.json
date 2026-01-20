@@ -1,0 +1,12 @@
+{
+  "name": "tailgate",
+  "main": "index.ts",
+  "devDependencies": {
+    "@types/node": "^20"
+  },
+  "dependencies": {
+    "@pulumi/pulumi": "^3",
+    "@pulumi/gcp": "^7",
+    "@pulumi/tailscale": "^0"
+  }
+}
