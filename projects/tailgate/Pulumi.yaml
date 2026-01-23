@@ -1,3 +1,3 @@
 name: tailgate
 runtime: nodejs
-description: GCP f1-micro VM running Tailscale + nginx for admin route protection
+description: Tailgate - admin access via Tailscale proxy to Vercel app

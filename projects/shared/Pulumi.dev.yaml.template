@@ -1,5 +1,0 @@
-config:
-  # Optional: provide your own tailnet secret (64 characters, alphanumeric)
-  # If not provided, one will be generated automatically
-  # shared:tailnetSecret:
-  #   secure: <encrypted-value>

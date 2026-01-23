@@ -1,28 +1,53 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as gcp from "@pulumi/gcp";
+import * as random from "@pulumi/random";
 import * as tailscale from "@pulumi/tailscale";
+import * as vercel from "@pulumiverse/vercel";
 
 const config = new pulumi.Config();
 const stack = pulumi.getStack();
 
-// Stack references
-const sharedRef = new pulumi.StackReference(`shared-${stack}`, {
-  name: pulumi.interpolate`${pulumi.getOrganization()}/shared/${stack}`,
+// =============================================================================
+// Tailnet Secret (merged from shared)
+// =============================================================================
+
+// Allow user to provide their own tailnet secret, otherwise generate one
+const providedTailnetSecret = config.getSecret("tailnetSecret");
+
+const generatedSecret = new random.RandomPassword("tailnet-secret", {
+  length: 64,
+  special: false,
 });
 
-const vercelRef = new pulumi.StackReference(`vercel-${stack}`, {
-  name: pulumi.interpolate`${pulumi.getOrganization()}/vercel/${stack}`,
-});
+// Use provided secret if available, otherwise use generated one
+const tailnetSecret = providedTailnetSecret ?? generatedSecret.result;
 
-// Get values from other stacks
-const tailnetSecret = sharedRef.getOutput("tailnetSecret");
-const vercelDomain = vercelRef.getOutput("vercelDomain");
-const customDomain = vercelRef.getOutput("customDomainName");
+// =============================================================================
+// Vercel Project (lookup existing, manage TAILNET_SECRET only)
+// =============================================================================
 
-// Use custom domain if available, otherwise use Vercel domain
-const upstreamDomain = customDomain.apply((cd) =>
-  cd ? cd : vercelDomain.apply((vd) => vd as string)
+const vercelProjectName = config.require("vercelProjectName");
+
+// Look up the existing Vercel project (created by Vercel-MongoDB integration)
+const vercelProject = vercel.getProjectOutput({ name: vercelProjectName });
+
+// Set the TAILNET_SECRET environment variable
+const tailnetSecretEnv = new vercel.ProjectEnvironmentVariable(
+  "tailnet-secret",
+  {
+    projectId: vercelProject.id,
+    key: "TAILNET_SECRET",
+    value: tailnetSecret,
+    targets: ["production", "preview"],
+  },
 );
+
+// Get the domain for the upstream proxy target
+const vercelDomain = pulumi.interpolate`${vercelProjectName}.vercel.app`;
+
+// =============================================================================
+// GCP + Tailscale VM (the actual tailgate)
+// =============================================================================
 
 // Configuration
 const gcpZone = config.get("zone") ?? "us-central1-a";
@@ -40,7 +65,7 @@ const authKey = new tailscale.TailnetKey("tailgate-auth-key", {
 
 // Startup script that installs Tailscale and nginx
 const startupScript = pulumi
-  .all([authKey.key, tailnetSecret, upstreamDomain, hostname, tailnetName])
+  .all([authKey.key, tailnetSecret, vercelDomain, hostname, tailnetName])
   .apply(([authKeyValue, secret, upstream, host, tailnet]) => {
     // Determine the full hostname for certs
     const fullHostname = tailnet.includes(".")
@@ -178,11 +203,23 @@ const sshFirewall = new gcp.compute.Firewall("allow-ssh-tailgate", {
   targetTags: ["allow-ssh"],
 });
 
+// =============================================================================
 // Exports
+// =============================================================================
+
+// Secret (for reference/debugging - marked as secret)
+export const tailnetSecretValue = pulumi.secret(tailnetSecret);
+
+// Vercel
+export const vercelProjectId = vercelProject.id;
+
+// GCP VM
 export const vmName = vm.name;
 export const vmZone = vm.zone;
 export const vmExternalIp = vm.networkInterfaces.apply(
-  (nis) => nis[0].accessConfigs?.[0].natIp
+  (nis) => nis[0].accessConfigs?.[0].natIp,
 );
+
+// Access URLs
 export const tailgateUrl = pulumi.interpolate`https://${hostname}.${tailnetName}${tailnetName.includes(".") ? "" : ".ts.net"}`;
 export const sshCommand = pulumi.interpolate`gcloud compute ssh ${vm.name} --zone=${gcpZone}`;

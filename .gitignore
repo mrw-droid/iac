@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Pulumi
+Pulumi.*.yaml
+!Pulumi.yaml
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/
