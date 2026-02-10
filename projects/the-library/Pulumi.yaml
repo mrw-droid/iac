@@ -1,0 +1,3 @@
+name: the-library
+runtime: nodejs
+description: Tailscale Kubernetes operator deployment via Helm
