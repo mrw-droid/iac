@@ -3,14 +3,26 @@ import * as k8s from "@pulumi/kubernetes";
 
 const config = new pulumi.Config();
 
-// Ignore spec.volumeName on PVCs — K8s sets this after binding and Pulumi
-// treats it as drift, triggering a destructive replace.
-const ignorePvcVolumeName = [(args: any) => {
+// Fix K8s state drift that Pulumi can't reconcile:
+// - PVCs: K8s sets spec.volumeName after binding; Pulumi sees it as an
+//   immutable field change and wants a destructive replace.
+// - RBAC: Helm creates Role/ClusterRole with `rules: []` but K8s normalizes
+//   that to omitting the field entirely, causing an endless update loop.
+const ignoreK8sDrift = [(args: any) => {
   if (args.type === "kubernetes:core/v1:PersistentVolumeClaim") {
     return {
       props: args.props,
       opts: pulumi.mergeOptions(args.opts, {
         ignoreChanges: ["spec.volumeName"],
+      }),
+    };
+  }
+  if (args.type === "kubernetes:rbac.authorization.k8s.io/v1:Role" ||
+      args.type === "kubernetes:rbac.authorization.k8s.io/v1:ClusterRole") {
+    return {
+      props: args.props,
+      opts: pulumi.mergeOptions(args.opts, {
+        ignoreChanges: ["rules"],
       }),
     };
   }
@@ -136,7 +148,7 @@ const minio = new k8s.helm.v4.Chart("minio", {
       },
     },
   },
-}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
+}, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
 
 // Tailscale-exposed services for MinIO (chart doesn't support loadBalancerClass)
 const minioTailscaleApi = new k8s.core.v1.Service("minio-tailscale-api", {
@@ -243,7 +255,7 @@ const loki = new k8s.helm.v4.Chart("loki", {
     chunksCache: { enabled: false },
     resultsCache: { enabled: false },
   },
-}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
+}, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
 
 // Prometheus — metrics (lean: server only, no alertmanager/pushgateway)
 const prometheus = new k8s.helm.v4.Chart("prometheus", {
@@ -271,7 +283,7 @@ const prometheus = new k8s.helm.v4.Chart("prometheus", {
       },
     },
   },
-}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
+}, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
 
 // Tempo — distributed tracing (single-binary, filesystem backend)
 const tempo = new k8s.helm.v4.Chart("tempo", {
@@ -298,7 +310,7 @@ const tempo = new k8s.helm.v4.Chart("tempo", {
       size: "100Gi",
     },
   },
-}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
+}, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
 
 // Grafana — dashboards and visualization
 const grafana = new k8s.helm.v4.Chart("grafana", {
@@ -336,7 +348,7 @@ const grafana = new k8s.helm.v4.Chart("grafana", {
           {
             name: "Tempo",
             type: "tempo",
-            url: "http://tempo.monitoring:3100",
+            url: "http://tempo.monitoring:3200",
             access: "proxy",
             isDefault: false,
           },
@@ -344,7 +356,7 @@ const grafana = new k8s.helm.v4.Chart("grafana", {
       },
     },
   },
-}, { dependsOn: [loki, prometheus, tempo], transforms: ignorePvcVolumeName });
+}, { dependsOn: [loki, prometheus, tempo], transforms: ignoreK8sDrift });
 
 // Alloy — OpenTelemetry collector (DaemonSet mode)
 const alloy = new k8s.helm.v4.Chart("alloy", {
@@ -533,7 +545,7 @@ const grafanaMcp = new k8s.apps.v1.Deployment("grafana-mcp", {
           args: ["-t", "streamable-http", "--address", "0.0.0.0:8000"],
           ports: [{ containerPort: 8000, name: "http" }],
           env: [
-            { name: "GRAFANA_URL", value: "http://grafana.monitoring:3000" },
+            { name: "GRAFANA_URL", value: "http://grafana.monitoring.svc.cluster.local" },
             {
               name: "GRAFANA_SERVICE_ACCOUNT_TOKEN",
               valueFrom: {
