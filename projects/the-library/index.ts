@@ -3,6 +3,20 @@ import * as k8s from "@pulumi/kubernetes";
 
 const config = new pulumi.Config();
 
+// Ignore spec.volumeName on PVCs — K8s sets this after binding and Pulumi
+// treats it as drift, triggering a destructive replace.
+const ignorePvcVolumeName = [(args: any) => {
+  if (args.type === "kubernetes:core/v1:PersistentVolumeClaim") {
+    return {
+      props: args.props,
+      opts: pulumi.mergeOptions(args.opts, {
+        ignoreChanges: ["spec.volumeName"],
+      }),
+    };
+  }
+  return undefined;
+}];
+
 // OAuth credentials (stored as Pulumi secrets)
 const oauthClientId = config.requireSecret("tailscaleOAuthClientId");
 const oauthClientSecret = config.requireSecret("tailscaleOAuthClientSecret");
@@ -16,6 +30,7 @@ const ns = new k8s.core.v1.Namespace("tailscale", {
 const tailscaleOperator = new k8s.helm.v4.Chart("tailscale-operator", {
   namespace: ns.metadata.name,
   chart: "tailscale-operator",
+  version: "1.92.5",
   repositoryOpts: {
     repo: "https://pkgs.tailscale.com/helmcharts",
   },
@@ -62,6 +77,7 @@ const clientInfoSecret = new k8s.core.v1.Secret("synology-csi-client-info", {
 const synologyCsi = new k8s.helm.v4.Chart("synology-csi", {
   namespace: synologyNs.metadata.name,
   chart: "synology-csi",
+  version: "0.10.0",
   repositoryOpts: {
     repo: "https://christian-schlichtherle.github.io/synology-csi-chart",
   },
@@ -95,6 +111,7 @@ const minioPvcSize = config.get("minioPvcSize") ?? "50Gi";
 const minio = new k8s.helm.v4.Chart("minio", {
   namespace: minioNs.metadata.name,
   chart: "minio",
+  version: "5.4.0",
   repositoryOpts: {
     repo: "https://charts.min.io/",
   },
@@ -119,7 +136,7 @@ const minio = new k8s.helm.v4.Chart("minio", {
       },
     },
   },
-}, { dependsOn: [synologyCsi] });
+}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
 
 // Tailscale-exposed services for MinIO (chart doesn't support loadBalancerClass)
 const minioTailscaleApi = new k8s.core.v1.Service("minio-tailscale-api", {
@@ -175,11 +192,13 @@ const monitoringNs = new k8s.core.v1.Namespace("monitoring", {
 });
 
 const grafanaAdminPassword = config.requireSecret("grafanaAdminPassword");
+const grafanaMcpToken = config.requireSecret("grafanaMcpServiceAccountToken");
 
 // Loki — log aggregation (single-binary mode, filesystem backend)
 const loki = new k8s.helm.v4.Chart("loki", {
   namespace: monitoringNs.metadata.name,
   chart: "loki",
+  version: "6.52.0",
   repositoryOpts: {
     repo: "https://grafana.github.io/helm-charts",
   },
@@ -224,12 +243,13 @@ const loki = new k8s.helm.v4.Chart("loki", {
     chunksCache: { enabled: false },
     resultsCache: { enabled: false },
   },
-}, { dependsOn: [synologyCsi] });
+}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
 
 // Prometheus — metrics (lean: server only, no alertmanager/pushgateway)
 const prometheus = new k8s.helm.v4.Chart("prometheus", {
   namespace: monitoringNs.metadata.name,
   chart: "prometheus",
+  version: "28.9.0",
   repositoryOpts: {
     repo: "https://prometheus-community.github.io/helm-charts",
   },
@@ -251,12 +271,13 @@ const prometheus = new k8s.helm.v4.Chart("prometheus", {
       },
     },
   },
-}, { dependsOn: [synologyCsi] });
+}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
 
 // Tempo — distributed tracing (single-binary, filesystem backend)
 const tempo = new k8s.helm.v4.Chart("tempo", {
   namespace: monitoringNs.metadata.name,
   chart: "tempo",
+  version: "1.24.4",
   repositoryOpts: {
     repo: "https://grafana.github.io/helm-charts",
   },
@@ -277,12 +298,13 @@ const tempo = new k8s.helm.v4.Chart("tempo", {
       size: "100Gi",
     },
   },
-}, { dependsOn: [synologyCsi] });
+}, { dependsOn: [synologyCsi], transforms: ignorePvcVolumeName });
 
 // Grafana — dashboards and visualization
 const grafana = new k8s.helm.v4.Chart("grafana", {
   namespace: monitoringNs.metadata.name,
   chart: "grafana",
+  version: "10.5.15",
   repositoryOpts: {
     repo: "https://grafana.github.io/helm-charts",
   },
@@ -322,12 +344,13 @@ const grafana = new k8s.helm.v4.Chart("grafana", {
       },
     },
   },
-}, { dependsOn: [loki, prometheus, tempo] });
+}, { dependsOn: [loki, prometheus, tempo], transforms: ignorePvcVolumeName });
 
 // Alloy — OpenTelemetry collector (DaemonSet mode)
 const alloy = new k8s.helm.v4.Chart("alloy", {
   namespace: monitoringNs.metadata.name,
   chart: "alloy",
+  version: "1.6.0",
   repositoryOpts: {
     repo: "https://grafana.github.io/helm-charts",
   },
@@ -481,6 +504,86 @@ const alloyOtlpHttp = new k8s.core.v1.Service("alloy-otlp-http", {
   },
 });
 
+// --- Grafana MCP Server ---
+
+const grafanaMcpSecret = new k8s.core.v1.Secret("grafana-mcp-token", {
+  metadata: {
+    name: "grafana-mcp-token",
+    namespace: monitoringNs.metadata.name,
+  },
+  stringData: {
+    token: grafanaMcpToken,
+  },
+});
+
+const grafanaMcp = new k8s.apps.v1.Deployment("grafana-mcp", {
+  metadata: {
+    name: "grafana-mcp",
+    namespace: monitoringNs.metadata.name,
+  },
+  spec: {
+    replicas: 1,
+    selector: { matchLabels: { app: "grafana-mcp" } },
+    template: {
+      metadata: { labels: { app: "grafana-mcp" } },
+      spec: {
+        containers: [{
+          name: "mcp-grafana",
+          image: "grafana/mcp-grafana:0.9.0",
+          args: ["-t", "streamable-http", "--address", "0.0.0.0:8000"],
+          ports: [{ containerPort: 8000, name: "http" }],
+          env: [
+            { name: "GRAFANA_URL", value: "http://grafana.monitoring:3000" },
+            {
+              name: "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+              valueFrom: {
+                secretKeyRef: {
+                  name: "grafana-mcp-token",
+                  key: "token",
+                },
+              },
+            },
+          ],
+          readinessProbe: {
+            httpGet: { path: "/healthz", port: 8000 },
+            initialDelaySeconds: 5,
+            periodSeconds: 10,
+          },
+          livenessProbe: {
+            httpGet: { path: "/healthz", port: 8000 },
+            initialDelaySeconds: 10,
+            periodSeconds: 30,
+          },
+          resources: {
+            requests: { memory: "64Mi", cpu: "50m" },
+            limits: { memory: "256Mi" },
+          },
+        }],
+      },
+    },
+  },
+}, { dependsOn: [grafana] });
+
+const grafanaMcpTailscale = new k8s.core.v1.Service("grafana-mcp-tailscale", {
+  metadata: {
+    name: "grafana-mcp-tailscale",
+    namespace: monitoringNs.metadata.name,
+    annotations: {
+      "tailscale.com/hostname": "grafana-mcp",
+    },
+  },
+  spec: {
+    type: "LoadBalancer",
+    loadBalancerClass: "tailscale",
+    selector: { app: "grafana-mcp" },
+    ports: [{
+      name: "http",
+      port: 80,
+      targetPort: 8000,
+    }],
+  },
+}, { dependsOn: [grafanaMcp] });
+
 // Exports
 export const operatorNamespace = ns.metadata.name;
 export const synologyCsiNamespace = synologyNs.metadata.name;
@@ -491,3 +594,4 @@ export const monitoringNamespace = monitoringNs.metadata.name;
 export const grafanaEndpoint = "grafana";
 export const alloyOtlpGrpcEndpoint = "alloy-otlp-grpc:4317";
 export const alloyOtlpHttpEndpoint = "alloy-otlp-http:4318";
+export const grafanaMcpEndpoint = "grafana-mcp";
