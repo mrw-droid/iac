@@ -1,7 +1,8 @@
 config:
-  # Your Tailscale tailnet name
-  # Can be just the name (e.g., "myname") or full domain (e.g., "myname.ts.net")
-  tailgate:tailnetName: "your-tailnet-name"
+  # Your Tailscale MagicDNS domain for URL construction
+  # This is found in Tailscale Admin Console -> DNS -> Tailnet name
+  # e.g., "tail1234.ts.net" or your custom domain like "example.com"
+  tailgate:tailnetDomain: "your-tailnet.ts.net"
 
   # Optional: GCP zone (default: us-central1-a, which is free tier eligible)
   # tailgate:zone: "us-central1-a"
@@ -16,4 +17,7 @@ config:
   # Tailscale provider configuration
   # Set via: pulumi config set --secret tailscale:apiKey "tskey-api-..."
   tailscale:apiKey: ""
-  tailscale:tailnet: "your-tailnet-name"
+  # tailscale:tailnet is the organization name for API calls
+  # This is typically your GitHub org (e.g., "myorg.github") or email domain
+  # Found in Tailscale Admin Console -> Settings -> General -> Organization
+  tailscale:tailnet: "your-org-name"

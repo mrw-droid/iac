@@ -51,7 +51,9 @@ const vercelDomain = pulumi.interpolate`${vercelProjectName}.vercel.app`;
 
 // Configuration
 const gcpZone = config.get("zone") ?? "us-central1-a";
-const tailnetName = config.require("tailnetName"); // e.g., "yourtailnet.ts.net" or just the tailnet name
+// tailnetDomain is the MagicDNS domain (e.g., "tail1234.ts.net" or "example.com")
+// This is separate from tailscale:tailnet which is the org name for API calls
+const tailnetDomain = config.require("tailnetDomain");
 const hostname = config.get("hostname") ?? "admin";
 
 // Create a Tailscale auth key for the VM
@@ -65,12 +67,12 @@ const authKey = new tailscale.TailnetKey("tailgate-auth-key", {
 
 // Startup script that installs Tailscale and nginx
 const startupScript = pulumi
-  .all([authKey.key, tailnetSecret, vercelDomain, hostname, tailnetName])
-  .apply(([authKeyValue, secret, upstream, host, tailnet]) => {
+  .all([authKey.key, tailnetSecret, vercelDomain, hostname, tailnetDomain])
+  .apply(([authKeyValue, secret, upstream, host, domain]) => {
     // Determine the full hostname for certs
-    const fullHostname = tailnet.includes(".")
-      ? `${host}.${tailnet}`
-      : `${host}.${tailnet}.ts.net`;
+    const fullHostname = domain.includes(".")
+      ? `${host}.${domain}`
+      : `${host}.${domain}.ts.net`;
 
     return `#!/bin/bash
 set -e
@@ -221,5 +223,5 @@ export const vmExternalIp = vm.networkInterfaces.apply(
 );
 
 // Access URLs
-export const tailgateUrl = pulumi.interpolate`https://${hostname}.${tailnetName}${tailnetName.includes(".") ? "" : ".ts.net"}`;
+export const tailgateUrl = pulumi.interpolate`https://${hostname}.${tailnetDomain}${tailnetDomain.includes(".") ? "" : ".ts.net"}`;
 export const sshCommand = pulumi.interpolate`gcloud compute ssh ${vm.name} --zone=${gcpZone}`;
