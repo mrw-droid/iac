@@ -281,6 +281,9 @@ const prometheus = new k8s.helm.v4.Chart("prometheus", {
         runAsGroup: 65534,
         fsGroup: 65534,
       },
+      extraFlags: [
+        "web.enable-remote-write-receiver",
+      ],
     },
   },
 }, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
@@ -415,7 +418,7 @@ loki.write "default" {
 
 otelcol.exporter.otlp "tempo" {
   client {
-    endpoint = "tempo.monitoring:4317"
+    endpoint = "tempo.monitoring.svc.cluster.local:4317"
     tls {
       insecure = true
     }
