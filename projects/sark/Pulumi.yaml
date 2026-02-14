@@ -1,0 +1,6 @@
+name: sark-infra
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Infrastructure for sark.flatline.ai - MCP gateway + Foundry VTT server
