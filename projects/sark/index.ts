@@ -16,9 +16,8 @@ const machineType = config.require("machineType");
 const googleOauthClientId = config.requireSecret("googleOauthClientId");
 const googleOauthClientSecret = config.requireSecret("googleOauthClientSecret");
 const authorizedEmail = config.requireSecret("authorizedEmail");
-const foundryLicenseKey = config.requireSecret("foundryLicenseKey");
-const foundryDownloadUrl = config.requireSecret("foundryDownloadUrl");
 const tailscaleAuthKey = config.requireSecret("tailscaleAuthKey");
+const mcpOauthEncryptionKey = config.requireSecret("mcpOauthEncryptionKey");
 
 // Optional: k8s MCP server endpoint on the tailnet
 // e.g. "http://100.x.x.x:3000" or "http://hostname:3000"
@@ -71,17 +70,27 @@ const sa = new gcp.serviceaccount.Account("sark-sa", {
 });
 
 // ---------------------------------------------------------------------------
+// Persistent Disk — Foundry VTT data
+// ---------------------------------------------------------------------------
+const foundryDisk = new gcp.compute.Disk("foundry", {
+  project,
+  zone,
+  name: "foundry",
+  size: 20, // GB
+  type: "pd-balanced",
+});
+
+// ---------------------------------------------------------------------------
 // Startup Script — orchestrates all the software setup
 // ---------------------------------------------------------------------------
 const startupScript = pulumi.all([
   googleOauthClientId,
   googleOauthClientSecret,
   authorizedEmail,
-  foundryLicenseKey,
-  foundryDownloadUrl,
   tailscaleAuthKey,
   k8sMcpEndpoint,
-]).apply(([oauthId, oauthSecret, email, fvttLicense, fvttUrl, tsKey, k8sEndpoint]) => `#!/bin/bash
+  mcpOauthEncryptionKey,
+]).apply(([oauthId, oauthSecret, email, tsKey, k8sEndpoint, encryptionKey]) => `#!/bin/bash
 set -euo pipefail
 exec > /var/log/sark-startup.log 2>&1
 echo "=== Sark startup $(date) ==="
@@ -92,7 +101,6 @@ echo "=== Sark startup $(date) ==="
 apt-get update
 apt-get install -y \\
   curl \\
-  unzip \\
   debian-keyring \\
   debian-archive-keyring \\
   apt-transport-https \\
@@ -157,51 +165,86 @@ tailscale up --authkey="${tsKey}" --hostname=sark --accept-routes || true
 echo "Tailscale connected"
 
 # -------------------------------------------------------------------------
-# Foundry VTT
+# MCP OAuth Proxy
+# -------------------------------------------------------------------------
+MCP_PROXY_VERSION="v0.0.2"
+MCP_PROXY_URL="https://github.com/obot-platform/mcp-oauth-proxy/releases/download/\${MCP_PROXY_VERSION}/mcp-oauth-proxy-linux-amd64"
+
+if [ ! -f /usr/local/bin/mcp-oauth-proxy ] || ! /usr/local/bin/mcp-oauth-proxy --version 2>/dev/null | grep -q "\${MCP_PROXY_VERSION}"; then
+  echo "Downloading mcp-oauth-proxy \${MCP_PROXY_VERSION}..."
+  curl -fSL -o /usr/local/bin/mcp-oauth-proxy "\${MCP_PROXY_URL}"
+  chmod +x /usr/local/bin/mcp-oauth-proxy
+fi
+
+if ! id "mcpproxy" &>/dev/null; then
+  useradd -r -s /usr/sbin/nologin -d /var/lib/mcp-oauth-proxy -m mcpproxy
+fi
+
+cat > /etc/systemd/system/mcp-oauth-proxy.service << 'MCPSVC'
+[Unit]
+Description=MCP OAuth 2.1 Proxy
+After=network.target tailscaled.service
+
+[Service]
+Type=simple
+User=mcpproxy
+Group=mcpproxy
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+MCPSVC
+
+# Append environment vars with secrets (can't use heredoc with variable expansion inside 'MCPSVC')
+cat >> /etc/systemd/system/mcp-oauth-proxy.service << MCPSVC_ENV
+Environment=OAUTH_CLIENT_ID=${oauthId}
+Environment=OAUTH_CLIENT_SECRET=${oauthSecret}
+Environment=OAUTH_AUTHORIZE_URL=https://accounts.google.com
+Environment=SCOPES_SUPPORTED=openid,email,profile
+Environment=MCP_SERVER_URL=${k8sEndpoint}
+Environment=ENCRYPTION_KEY=${encryptionKey}
+MCPSVC_ENV
+
+cat >> /etc/systemd/system/mcp-oauth-proxy.service << 'MCPSVC_END'
+ExecStart=/usr/local/bin/mcp-oauth-proxy
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/mcp-oauth-proxy
+
+[Install]
+WantedBy=multi-user.target
+MCPSVC_END
+
+systemctl daemon-reload
+systemctl enable mcp-oauth-proxy
+systemctl restart mcp-oauth-proxy
+echo "MCP OAuth Proxy started on 127.0.0.1:8080"
+
+# -------------------------------------------------------------------------
+# Foundry VTT — persistent disk mount
 # -------------------------------------------------------------------------
 FOUNDRY_USER="foundry"
-FOUNDRY_HOME="/opt/foundryvtt"
-FOUNDRY_DATA="/opt/foundrydata"
+FOUNDRY_DISK="/dev/disk/by-id/google-foundry"
 
 if ! id "$FOUNDRY_USER" &>/dev/null; then
-  useradd -r -m -d "$FOUNDRY_HOME" -s /bin/bash "$FOUNDRY_USER"
+  useradd -r -m -d /opt/foundryvtt -s /bin/bash "$FOUNDRY_USER"
 fi
 
-mkdir -p "$FOUNDRY_HOME" "$FOUNDRY_DATA"
-
-if [ ! -f "$FOUNDRY_HOME/main.mjs" ]; then
-  echo "Downloading Foundry VTT..."
-  cd /tmp
-  curl -fSL -o foundryvtt.zip "${fvttUrl}"
-  unzip -o foundryvtt.zip -d "$FOUNDRY_HOME"
-  rm foundryvtt.zip
+# Format the disk if it has no filesystem (first attach only)
+if ! blkid "$FOUNDRY_DISK" &>/dev/null; then
+  echo "Formatting foundry disk..."
+  mkfs.ext4 -m 0 -F -E lazy_itable_init=0,lazy_journal_init=0 "$FOUNDRY_DISK"
 fi
 
-chown -R "$FOUNDRY_USER":"$FOUNDRY_USER" "$FOUNDRY_HOME" "$FOUNDRY_DATA"
+# Mount to /opt (contains foundryvtt/ and foundrydata/ from prior install)
+if ! mountpoint -q /opt; then
+  mount -o discard,defaults "$FOUNDRY_DISK" /opt
+fi
 
-# Foundry options.json — run on localhost only, caddy handles TLS
-mkdir -p "$FOUNDRY_DATA/Config"
-cat > "$FOUNDRY_DATA/Config/options.json" << FVTTCFG
-{
-  "port": 30000,
-  "hostname": "127.0.0.1",
-  "routePrefix": null,
-  "sslCert": null,
-  "sslKey": null,
-  "awsConfig": null,
-  "dataPath": "$FOUNDRY_DATA",
-  "proxySSL": true,
-  "proxyPort": 443,
-  "minifyStaticFiles": true,
-  "updateChannel": "stable",
-  "language": "en.core",
-  "world": null,
-  "serviceConfig": null,
-  "licenseKey": "${fvttLicense}"
-}
-FVTTCFG
+# Persist in fstab
+if ! grep -q "google-foundry" /etc/fstab; then
+  echo "$FOUNDRY_DISK /opt ext4 discard,defaults,nofail 0 2" >> /etc/fstab
+fi
 
-chown -R "$FOUNDRY_USER":"$FOUNDRY_USER" "$FOUNDRY_DATA"
+chown -R "$FOUNDRY_USER":"$FOUNDRY_USER" /opt/foundryvtt /opt/foundrydata
 
 # Foundry systemd service
 cat > /etc/systemd/system/foundryvtt.service << 'FVTTSVC'
@@ -285,43 +328,16 @@ foundry.flatline.ai {
 }
 
 # -----------------------------------------------------------------------
-# Sark MCP Gateway — OAuth-protected
+# Sark MCP Gateway — OAuth 2.1 via mcp-oauth-proxy
 # -----------------------------------------------------------------------
 sark.flatline.ai {
-  # OAuth callback/portal routes (must be before authorize)
-  route /oauth2/* {
-    authenticate with myportal
-  }
-
-  # Health check endpoint (no auth)
+  # Health check at Caddy level
   route /healthz {
     respond "ok" 200
   }
 
-  # k8s MCP server — proxied to tailnet
-  route /k8s/* {
-    authorize with mcp_policy
-    uri strip_prefix /k8s
-    reverse_proxy ${k8sEndpoint} {
-      header_up Host {host}
-      header_up X-Forwarded-For {remote_host}
-    }
-  }
-
-  # Placeholder for future MCP servers
-  # route /vtt/* {
-  #   authorize with mcp_policy
-  #   uri strip_prefix /vtt
-  #   reverse_proxy http://TAILNET_IP:PORT {
-  #     header_up Host {host}
-  #   }
-  # }
-
-  # Default: show a simple status page
-  route /* {
-    authorize with mcp_policy
-    respond "🏮 Sark MCP Gateway — operational" 200
-  }
+  # Everything else proxied to mcp-oauth-proxy
+  reverse_proxy 127.0.0.1:8080
 }
 CADDYEOF
 
@@ -349,6 +365,11 @@ const instance = new gcp.compute.Instance("sark", {
       type: "pd-balanced",
     },
   },
+
+  attachedDisks: [{
+    source: foundryDisk.selfLink,
+    deviceName: "foundry",
+  }],
 
   networkInterfaces: [{
     network: "default",
@@ -387,6 +408,8 @@ export const sshCommand = pulumi.interpolate`gcloud compute ssh sark --zone=${zo
 export const startupLog = "sudo tail -f /var/log/sark-startup.log";
 export const caddyStatus = "sudo systemctl status caddy";
 export const foundryStatus = "sudo systemctl status foundryvtt";
+export const mcpOauthProxyStatus = "sudo systemctl status mcp-oauth-proxy";
+export const mcpOauthProxyLogs = "sudo journalctl -u mcp-oauth-proxy -f";
 
 // DNS instructions (since Porkbun is managed manually)
 export const dnsInstructions = pulumi.interpolate`
