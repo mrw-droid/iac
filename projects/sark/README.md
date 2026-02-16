@@ -2,7 +2,7 @@
 
 > *"I'm Sark. I work for the MCP."*
 
-MCP gateway + Foundry VTT server on GCP, fronted by Caddy with Google OAuth.
+MCP gateway + Foundry VTT server on GCP. Caddy handles TLS, agentgateway handles JWT-authenticated MCP proxying to backend servers on the tailnet, and Google OAuth protects Foundry VTT.
 
 ## Architecture
 
@@ -10,13 +10,11 @@ MCP gateway + Foundry VTT server on GCP, fronted by Caddy with Google OAuth.
 Internet
     │
     ▼
-sark.flatline.ai (Caddy + Google OAuth)
-    ├── /k8s  ──► kubernetes-mcp-server (via tailnet)
-    ├── /vtt  ──► foundry-vtt-mcp (via tailnet) [future]
-    └── /*    ──► status page
-    
-foundry.flatline.ai (Caddy, no OAuth)
-    └── ──► Foundry VTT (localhost:30000)
+sark.flatline.ai (Caddy TLS → agentgateway, JWT auth)
+    └── /*  ──► agentgateway :8081 ──► kubernetes-mcp-server (via tailnet)
+
+foundry.flatline.ai (Caddy TLS + Google OAuth)
+    └── /*  ──► Foundry VTT (localhost:30000)
 
 All on a single GCP n2d-standard-4 VM running Debian 13 (Trixie).
 Tailscale connects to the homelab tailnet for MCP backend access.
@@ -27,67 +25,60 @@ Tailscale connects to the homelab tailnet for MCP backend access.
 - Pulumi CLI installed and logged in
 - GCP CLI (`gcloud`) authenticated with access to `foundry-487415`
 - A Tailscale auth key (create at https://login.tailscale.com/admin/settings/keys)
-- A Foundry VTT license key and download URL
-- Google OAuth credentials (see below)
+- Google OAuth credentials (for Foundry VTT access — see below)
 
-## Step 1: Create Google OAuth Credentials
+## Step 1: Generate JWT Keypair
 
-This is the one thing that can't be fully automated. It takes ~5 minutes.
-
-1. Go to [Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials?project=foundry-487415)
-
-2. Click **"+ CREATE CREDENTIALS"** → **"OAuth client ID"**
-
-3. If prompted, configure the **OAuth consent screen** first:
-   - User Type: **External**
-   - App name: `Sark MCP Gateway`
-   - User support email: your email
-   - Developer contact: your email
-   - Scopes: add `email`, `profile`, `openid`
-   - **Test users**: add your Google email address
-   - **DO NOT publish the app** — leave it in "Testing" mode
-   
-   > This is the key trick: in testing mode, only the whitelisted
-   > email addresses can authenticate. Max 100 test users, and you
-   > only need one.
-
-4. Back to Credentials → Create OAuth client ID:
-   - Application type: **Web application**
-   - Name: `Sark MCP Gateway`
-   - Authorized redirect URIs:
-     - `https://sark.flatline.ai/oauth2/google/authorization-code-callback`
-   - Click **Create**
-
-5. Copy the **Client ID** and **Client Secret**
-
-## Step 2: Configure Pulumi Secrets
+agentgateway uses JWT tokens for authentication. Generate an EC P-256 keypair and convert the public key to JWKS:
 
 ```bash
-cd sark-infra
+# Generate EC P-256 private key (keep this local — never upload it)
+openssl ecparam -genkey -name prime256v1 -noout -out ~/.creds/sark-jwt-private.pem
+
+# Convert public key to JWKS JSON for agentgateway
+uv run --with PyJWT --with cryptography scripts/gen_jwks.py ~/.creds/sark-jwt-private.pem > sark-jwt-public.jwks
+```
+
+The private key stays on your machine (`~/.creds/sark-jwt-private.pem`) for minting tokens. The JWKS JSON gets stored in Pulumi config so agentgateway can verify them.
+
+## Step 2: Create Google OAuth Credentials
+
+Required for Foundry VTT access (not MCP — that uses JWT now).
+
+1. Go to [Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials?project=foundry-487415)
+2. Click **"+ CREATE CREDENTIALS"** → **"OAuth client ID"**
+3. Configure the **OAuth consent screen** if prompted:
+   - User Type: **External**, leave in "Testing" mode
+   - Scopes: `email`, `profile`, `openid`
+   - **Test users**: add your Google email
+4. Create OAuth client ID:
+   - Application type: **Web application**
+   - Name: `Sark MCP Gateway`
+   - Authorized redirect URIs: `https://foundry.flatline.ai/oauth2/google/authorization-code-callback`
+5. Copy the **Client ID** and **Client Secret**
+
+## Step 3: Configure Pulumi Secrets
+
+```bash
+cd projects/sark
 pulumi stack init prod
 
-# Google OAuth (from step 1)
+# JWT JWKS (from step 1)
+cat sark-jwt-public.jwks | pulumi config set --secret sark-infra:jwtJwks
+
+# Google OAuth (from step 2, for Foundry VTT)
 pulumi config set --secret sark-infra:googleOauthClientId "YOUR_CLIENT_ID.apps.googleusercontent.com"
 pulumi config set --secret sark-infra:googleOauthClientSecret "GOCSPX-YOUR_SECRET"
-
-# Your Google email (the one whitelisted in OAuth test mode)
 pulumi config set --secret sark-infra:authorizedEmail "you@gmail.com"
-
-# Foundry VTT
-pulumi config set --secret sark-infra:foundryLicenseKey "YOUR-FVTT-LICENSE-KEY"
-# Get this URL from https://foundryvtt.com/me/licenses → your license → Linux/NodeJS download link
-pulumi config set --secret sark-infra:foundryDownloadUrl "https://foundryvtt.com/releases/..."
 
 # Tailscale auth key (ephemeral, reusable recommended)
 pulumi config set --secret sark-infra:tailscaleAuthKey "tskey-auth-XXXXX"
 
-# The k8s MCP server endpoint on the tailnet
-# This is where containers/kubernetes-mcp-server is running
-# e.g., the tailnet IP of your k8s control plane node + port
+# k8s MCP server endpoint on the tailnet
 pulumi config set sark-infra:k8sMcpEndpoint "http://100.x.x.x:3001"
 ```
 
-## Step 3: Deploy
+## Step 4: Deploy
 
 ```bash
 pulumi up
@@ -99,7 +90,7 @@ This creates:
 - n2d-standard-4 VM with Debian 13
 - Startup script that installs and configures everything
 
-## Step 4: DNS Records (Porkbun)
+## Step 5: DNS Records (Porkbun)
 
 After `pulumi up`, it will output the static IP. Create these A records in Porkbun:
 
@@ -108,7 +99,7 @@ After `pulumi up`, it will output the static IP. Create these A records in Porkb
 | A | sark.flatline.ai | (static IP from output) |
 | A | foundry.flatline.ai | (static IP from output) |
 
-## Step 5: Verify
+## Step 6: Verify
 
 ```bash
 # SSH in and watch the startup script
@@ -117,15 +108,43 @@ sudo tail -f /var/log/sark-startup.log
 
 # Check services
 sudo systemctl status caddy
+sudo systemctl status agentgateway
 sudo systemctl status foundryvtt
 tailscale status
 
 # Test endpoints (after DNS propagates and Caddy gets TLS certs)
-curl -I https://foundry.flatline.ai
 curl -I https://sark.flatline.ai/healthz
+curl -I https://foundry.flatline.ai
 ```
 
-## Step 6: Set Up kubernetes-mcp-server on the Homelab
+## Minting JWT Tokens
+
+Use the private key from Step 1 to create tokens for MCP clients:
+
+```bash
+uv run --with PyJWT --with cryptography scripts/mint_jwt.py
+```
+
+## Connecting Claude
+
+**Claude Code CLI:**
+```bash
+claude mcp add --transport http tailscale-tools https://sark.flatline.ai/mcp \
+  --header "Authorization: Bearer <jwt>"
+```
+
+**Claude API (tool_use with MCP):**
+```json
+{
+  "mcp_servers": [{
+    "type": "url",
+    "url": "https://sark.flatline.ai/mcp",
+    "authorization_token": "<jwt>"
+  }]
+}
+```
+
+## Step 7: Set Up kubernetes-mcp-server on the Homelab
 
 On whichever homelab machine has kubectl access to your cluster, run the
 `containers/kubernetes-mcp-server` in HTTP mode:
@@ -148,6 +167,24 @@ docker run -d \
 The server will be accessible at `http://<tailnet-ip>:3001` from sark via
 Tailscale. Update the `k8sMcpEndpoint` config if the IP/port differs.
 
+## Adding More MCP Backends
+
+Add new targets to the agentgateway config in `index.ts` under `backends`:
+
+```yaml
+backends:
+  - mcp:
+      targets:
+        - name: k8s-tools
+          mcp:
+            host: http://100.x.x.x:3001
+        - name: new-server
+          mcp:
+            host: http://100.x.x.x:PORT
+```
+
+Then `pulumi up` to redeploy.
+
 ## Saving Money
 
 The VM is n2d-standard-4 (~$100/month if always on). To save money when
@@ -164,29 +201,14 @@ gcloud compute instances start sark --zone=us-west1-b --project=foundry-487415
 The static IP costs ~$2.40/month even when the VM is stopped, which is
 the price of not having to update DNS every time.
 
-## Adding More MCP Servers
-
-To add a new MCP backend (e.g., foundry-vtt-mcp):
-
-1. Run the MCP server on your tailnet
-2. Edit the Caddyfile (on the VM at `/etc/caddy/Caddyfile`):
-   ```
-   route /vtt/* {
-     authorize with mcp_policy
-     uri strip_prefix /vtt
-     reverse_proxy http://TAILNET_IP:PORT
-   }
-   ```
-3. `sudo systemctl reload caddy`
-
-Or better — update the startup script in `index.ts` and `pulumi up` to
-keep infrastructure as code.
-
 ## Troubleshooting
 
 ```bash
 # Caddy logs
 sudo journalctl -u caddy -f
+
+# Agent Gateway logs
+sudo journalctl -u agentgateway -f
 
 # Foundry logs
 sudo journalctl -u foundryvtt -f

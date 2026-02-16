@@ -17,10 +17,9 @@ const googleOauthClientId = config.requireSecret("googleOauthClientId");
 const googleOauthClientSecret = config.requireSecret("googleOauthClientSecret");
 const authorizedEmail = config.requireSecret("authorizedEmail");
 const tailscaleAuthKey = config.requireSecret("tailscaleAuthKey");
-const mcpOauthEncryptionKey = config.requireSecret("mcpOauthEncryptionKey");
+const jwtJwks = config.requireSecret("jwtJwks");
 
-// Optional: k8s MCP server endpoint on the tailnet
-// e.g. "http://100.x.x.x:3000" or "http://hostname:3000"
+// k8s MCP server endpoint on the tailnet (SSE URL for agentgateway backend)
 const k8sMcpEndpoint = config.get("k8sMcpEndpoint") || "http://127.0.0.1:3001";
 
 // ---------------------------------------------------------------------------
@@ -89,8 +88,8 @@ const startupScript = pulumi.all([
   authorizedEmail,
   tailscaleAuthKey,
   k8sMcpEndpoint,
-  mcpOauthEncryptionKey,
-]).apply(([oauthId, oauthSecret, email, tsKey, k8sEndpoint, encryptionKey]) => `#!/bin/bash
+  jwtJwks,
+]).apply(([oauthId, oauthSecret, email, tsKey, k8sEndpoint, jwks]) => `#!/bin/bash
 set -euo pipefail
 exec > /var/log/sark-startup.log 2>&1
 echo "=== Sark startup $(date) ==="
@@ -165,58 +164,81 @@ tailscale up --authkey="${tsKey}" --hostname=sark --accept-routes || true
 echo "Tailscale connected"
 
 # -------------------------------------------------------------------------
-# MCP OAuth Proxy
+# Agent Gateway — JWT-authenticated MCP proxy
 # -------------------------------------------------------------------------
-MCP_PROXY_VERSION="v0.0.2"
-MCP_PROXY_URL="https://github.com/obot-platform/mcp-oauth-proxy/releases/download/\${MCP_PROXY_VERSION}/mcp-oauth-proxy-linux-amd64"
+AGW_VERSION="v0.12.0"
+AGW_URL="https://github.com/agentgateway/agentgateway/releases/download/\${AGW_VERSION}/agentgateway-linux-amd64"
 
-if [ ! -f /usr/local/bin/mcp-oauth-proxy ] || ! /usr/local/bin/mcp-oauth-proxy --version 2>/dev/null | grep -q "\${MCP_PROXY_VERSION}"; then
-  echo "Downloading mcp-oauth-proxy \${MCP_PROXY_VERSION}..."
-  curl -fSL -o /usr/local/bin/mcp-oauth-proxy "\${MCP_PROXY_URL}"
-  chmod +x /usr/local/bin/mcp-oauth-proxy
+if [ ! -f /usr/local/bin/agentgateway ] || ! /usr/local/bin/agentgateway --version 2>/dev/null | grep -q "\${AGW_VERSION#v}"; then
+  echo "Downloading agentgateway \${AGW_VERSION}..."
+  curl -fSL -o /usr/local/bin/agentgateway "\${AGW_URL}"
+  chmod +x /usr/local/bin/agentgateway
 fi
 
-if ! id "mcpproxy" &>/dev/null; then
-  useradd -r -s /usr/sbin/nologin -d /var/lib/mcp-oauth-proxy -m mcpproxy
+if ! id "agentgateway" &>/dev/null; then
+  useradd -r -s /usr/sbin/nologin -d /nonexistent agentgateway
 fi
 
-cat > /etc/systemd/system/mcp-oauth-proxy.service << 'MCPSVC'
+mkdir -p /etc/agentgateway/jwt /var/log/agentgateway
+chown agentgateway:agentgateway /var/log/agentgateway
+
+# Write JWKS JSON for agentgateway JWT verification
+cat > /etc/agentgateway/jwt/pub-key.jwks << 'JWKSEOF'
+${jwks}
+JWKSEOF
+
+cat > /etc/agentgateway/config.yaml << AGWCFG
+config:
+  adminAddr: 127.0.0.1:15000
+
+binds:
+  - port: 8081
+    listeners:
+      - name: mcp-public
+        protocol: HTTP
+        routes:
+          - name: mcp-tools
+            policies:
+              cors:
+                allowOrigins: ["*"]
+                allowHeaders: [mcp-protocol-version, content-type, cache-control, authorization]
+                exposeHeaders: [Mcp-Session-Id]
+              jwtAuth:
+                mode: strict
+                issuer: sark.flatline.ai
+                audiences: [sark.flatline.ai]
+                jwks:
+                  file: /etc/agentgateway/jwt/pub-key.jwks
+            backends:
+              - mcp:
+                  targets:
+                    - name: k8s-tools
+                      mcp:
+                        host: ${k8sEndpoint}
+AGWCFG
+
+cat > /etc/systemd/system/agentgateway.service << 'AGWSVC'
 [Unit]
-Description=MCP OAuth 2.1 Proxy
-After=network.target tailscaled.service
+Description=Agent Gateway — MCP proxy with JWT auth
+After=network-online.target tailscaled.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=mcpproxy
-Group=mcpproxy
-Environment=HOST=127.0.0.1
-Environment=PORT=8080
-MCPSVC
-
-# Append environment vars with secrets (can't use heredoc with variable expansion inside 'MCPSVC')
-cat >> /etc/systemd/system/mcp-oauth-proxy.service << MCPSVC_ENV
-Environment=OAUTH_CLIENT_ID=${oauthId}
-Environment=OAUTH_CLIENT_SECRET=${oauthSecret}
-Environment=OAUTH_AUTHORIZE_URL=https://accounts.google.com
-Environment=SCOPES_SUPPORTED=openid,email,profile
-Environment=MCP_SERVER_URL=${k8sEndpoint}
-Environment=ENCRYPTION_KEY=${encryptionKey}
-MCPSVC_ENV
-
-cat >> /etc/systemd/system/mcp-oauth-proxy.service << 'MCPSVC_END'
-ExecStart=/usr/local/bin/mcp-oauth-proxy
+User=agentgateway
+Group=agentgateway
+ExecStart=/usr/local/bin/agentgateway -f /etc/agentgateway/config.yaml
 Restart=on-failure
 RestartSec=5
-WorkingDirectory=/var/lib/mcp-oauth-proxy
 
 [Install]
 WantedBy=multi-user.target
-MCPSVC_END
+AGWSVC
 
 systemctl daemon-reload
-systemctl enable mcp-oauth-proxy
-systemctl restart mcp-oauth-proxy
-echo "MCP OAuth Proxy started on 127.0.0.1:8080"
+systemctl enable agentgateway
+systemctl restart agentgateway
+echo "Agent Gateway started on 127.0.0.1:8081"
 
 # -------------------------------------------------------------------------
 # Foundry VTT — persistent disk mount
@@ -328,16 +350,14 @@ foundry.flatline.ai {
 }
 
 # -----------------------------------------------------------------------
-# Sark MCP Gateway — OAuth 2.1 via mcp-oauth-proxy
+# Sark MCP Gateway — JWT auth via agentgateway
 # -----------------------------------------------------------------------
 sark.flatline.ai {
-  # Health check at Caddy level
   route /healthz {
     respond "ok" 200
   }
 
-  # Everything else proxied to mcp-oauth-proxy
-  reverse_proxy 127.0.0.1:8080
+  reverse_proxy 127.0.0.1:8081
 }
 CADDYEOF
 
@@ -408,8 +428,8 @@ export const sshCommand = pulumi.interpolate`gcloud compute ssh sark --zone=${zo
 export const startupLog = "sudo tail -f /var/log/sark-startup.log";
 export const caddyStatus = "sudo systemctl status caddy";
 export const foundryStatus = "sudo systemctl status foundryvtt";
-export const mcpOauthProxyStatus = "sudo systemctl status mcp-oauth-proxy";
-export const mcpOauthProxyLogs = "sudo journalctl -u mcp-oauth-proxy -f";
+export const agentgatewayStatus = "sudo systemctl status agentgateway";
+export const agentgatewayLogs = "sudo journalctl -u agentgateway -f";
 
 // DNS instructions (since Porkbun is managed manually)
 export const dnsInstructions = pulumi.interpolate`
