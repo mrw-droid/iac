@@ -54,6 +54,21 @@ const tailscaleOperator = new k8s.helm.v4.Chart("tailscale-operator", {
   },
 });
 
+// --- Volume Snapshot CRDs + Controller ---
+// Must deploy before Synology CSI so its Helm `lookup`-gated snapshot
+// templates (snapshotter StatefulSet + VolumeSnapshotClasses) activate.
+const snapshotController = new k8s.helm.v4.Chart("snapshot-controller", {
+  namespace: "kube-system",
+  chart: "snapshot-controller",
+  version: "3.0.6",
+  repositoryOpts: {
+    repo: "https://piraeus.io/helm-charts/",
+  },
+  values: {
+    installCRDs: true,
+  },
+});
+
 // --- Synology CSI Driver ---
 
 const synologyNs = new k8s.core.v1.Namespace("synology-csi", {
@@ -108,7 +123,45 @@ const synologyCsi = new k8s.helm.v4.Chart("synology-csi", {
       },
     },
   },
-}, { dependsOn: [clientInfoSecret] });
+}, { dependsOn: [clientInfoSecret, snapshotController] });
+
+// The Synology CSI chart's snapshotter ClusterRole only grants "update" on
+// volumesnapshotcontents/status, but the csi-snapshotter sidecar also needs
+// "patch". Add a supplemental role to close the gap.
+const snapshotterRbacFix = new k8s.rbac.v1.ClusterRole("synology-csi-snapshotter-extra", {
+  metadata: { name: "synology-csi-snapshotter-extra" },
+  rules: [
+    {
+      apiGroups: ["snapshot.storage.k8s.io"],
+      resources: ["volumesnapshotcontents"],
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"],
+    },
+    {
+      apiGroups: ["snapshot.storage.k8s.io"],
+      resources: ["volumesnapshotcontents/status"],
+      verbs: ["update", "patch"],
+    },
+    {
+      apiGroups: ["snapshot.storage.k8s.io"],
+      resources: ["volumesnapshotclasses"],
+      verbs: ["get", "list", "watch"],
+    },
+  ],
+});
+
+const snapshotterRbacFixBinding = new k8s.rbac.v1.ClusterRoleBinding("synology-csi-snapshotter-extra", {
+  metadata: { name: "synology-csi-snapshotter-extra" },
+  roleRef: {
+    apiGroup: "rbac.authorization.k8s.io",
+    kind: "ClusterRole",
+    name: "synology-csi-snapshotter-extra",
+  },
+  subjects: [{
+    kind: "ServiceAccount",
+    name: "synology-csi-snapshotter",
+    namespace: "synology-csi",
+  }],
+}, { dependsOn: [synologyCsi] });
 
 // --- MinIO (S3-compatible object storage) ---
 
@@ -268,8 +321,8 @@ const prometheus = new k8s.helm.v4.Chart("prometheus", {
   values: {
     alertmanager: { enabled: false },
     "prometheus-pushgateway": { enabled: false },
-    "kube-state-metrics": { enabled: false },
-    "prometheus-node-exporter": { enabled: false },
+    "kube-state-metrics": { enabled: true },
+    "prometheus-node-exporter": { enabled: true },
     server: {
       persistentVolume: {
         enabled: true,
@@ -599,6 +652,102 @@ const grafanaMcpTailscale = new k8s.core.v1.Service("grafana-mcp-tailscale", {
   },
 }, { dependsOn: [grafanaMcp] });
 
+// --- Gitea (self-hosted Git) ---
+
+const giteaNs = new k8s.core.v1.Namespace("gitea", {
+  metadata: { name: "gitea" },
+});
+
+const giteaAdminUser = config.requireSecret("giteaAdminUser");
+const giteaAdminPassword = config.requireSecret("giteaAdminPassword");
+const giteaPvcSize = config.get("giteaPvcSize") ?? "100Gi";
+
+const gitea = new k8s.helm.v4.Chart("gitea", {
+  namespace: giteaNs.metadata.name,
+  chart: "oci://docker.gitea.com/charts/gitea",
+  version: "12.5.0",
+  values: {
+    global: {
+      storageClass: "synology-csi-iscsi-retain",
+    },
+    gitea: {
+      admin: {
+        username: giteaAdminUser,
+        password: giteaAdminPassword,
+        email: "gitea@local.domain",
+      },
+    },
+    persistence: {
+      enabled: true,
+      size: giteaPvcSize,
+    },
+    "postgresql-ha": {
+      enabled: true,
+      persistence: {
+        enabled: true,
+        size: giteaPvcSize,
+      },
+    },
+    service: {
+      http: {
+        type: "ClusterIP",
+        port: 3000,
+      },
+      ssh: {
+        type: "ClusterIP",
+        port: 22,
+      },
+    },
+  },
+}, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
+
+// Tailscale-exposed services for Gitea
+const giteaTailscaleHttp = new k8s.core.v1.Service("gitea-tailscale-http", {
+  metadata: {
+    name: "gitea-tailscale-http",
+    namespace: giteaNs.metadata.name,
+    annotations: {
+      "tailscale.com/hostname": "gitea",
+    },
+  },
+  spec: {
+    type: "LoadBalancer",
+    loadBalancerClass: "tailscale",
+    selector: {
+      "app.kubernetes.io/name": "gitea",
+      "app.kubernetes.io/instance": "gitea",
+    },
+    ports: [{
+      name: "http",
+      port: 80,
+      targetPort: 3000,
+    }],
+  },
+});
+
+const giteaTailscaleSsh = new k8s.core.v1.Service("gitea-tailscale-ssh", {
+  metadata: {
+    name: "gitea-tailscale-ssh",
+    namespace: giteaNs.metadata.name,
+    annotations: {
+      "tailscale.com/hostname": "gitea-ssh",
+    },
+  },
+  spec: {
+    type: "LoadBalancer",
+    loadBalancerClass: "tailscale",
+    selector: {
+      "app.kubernetes.io/name": "gitea",
+      "app.kubernetes.io/instance": "gitea",
+    },
+    ports: [{
+      name: "ssh",
+      port: 22,
+      targetPort: 22,
+    }],
+  },
+});
+
 // Exports
 export const operatorNamespace = ns.metadata.name;
 export const synologyCsiNamespace = synologyNs.metadata.name;
@@ -610,3 +759,6 @@ export const grafanaEndpoint = "grafana";
 export const alloyOtlpGrpcEndpoint = "alloy-otlp-grpc:4317";
 export const alloyOtlpHttpEndpoint = "alloy-otlp-http:4318";
 export const grafanaMcpEndpoint = "grafana-mcp";
+export const giteaNamespace = giteaNs.metadata.name;
+export const giteaEndpoint = "gitea";
+export const giteaSshEndpoint = "gitea-ssh";
