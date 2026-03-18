@@ -1,0 +1,3 @@
+[submodule "projects/library-applications/charts/agenta"]
+	path = projects/library-applications/charts/agenta
+	url = https://github.com/Agenta-AI/agenta.git

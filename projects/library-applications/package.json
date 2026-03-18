@@ -1,0 +1,11 @@
+{
+  "name": "library-applications",
+  "main": "index.ts",
+  "devDependencies": {
+    "@types/node": "^20"
+  },
+  "dependencies": {
+    "@pulumi/pulumi": "^3",
+    "@pulumi/kubernetes": "^4"
+  }
+}

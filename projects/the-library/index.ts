@@ -42,7 +42,7 @@ const ns = new k8s.core.v1.Namespace("tailscale", {
 const tailscaleOperator = new k8s.helm.v4.Chart("tailscale-operator", {
   namespace: ns.metadata.name,
   chart: "tailscale-operator",
-  version: "1.92.5",
+  version: "1.94.2",
   repositoryOpts: {
     repo: "https://pkgs.tailscale.com/helmcharts",
   },
@@ -501,25 +501,29 @@ otelcol.exporter.otlp "tempo" {
 }, { dependsOn: [loki, prometheus, tempo] });
 
 // Tailscale-exposed services for observability
-const grafanaTailscale = new k8s.core.v1.Service("grafana-tailscale", {
+// Tailscale Ingress for Grafana — auto-provisions LE certs
+const grafanaIngress = new k8s.networking.v1.Ingress("grafana-tailscale", {
   metadata: {
     name: "grafana-tailscale",
     namespace: monitoringNs.metadata.name,
-    annotations: {
-      "tailscale.com/hostname": "grafana",
-    },
   },
   spec: {
-    type: "LoadBalancer",
-    loadBalancerClass: "tailscale",
-    selector: {
-      "app.kubernetes.io/name": "grafana",
-      "app.kubernetes.io/instance": "grafana",
-    },
-    ports: [{
-      name: "http",
-      port: 80,
-      targetPort: 3000,
+    ingressClassName: "tailscale",
+    tls: [{ hosts: ["grafana"] }],
+    rules: [{
+      host: "grafana",
+      http: {
+        paths: [{
+          path: "/",
+          pathType: "Prefix",
+          backend: {
+            service: {
+              name: "grafana",
+              port: { number: 80 },
+            },
+          },
+        }],
+      },
     }],
   },
 });
@@ -652,102 +656,6 @@ const grafanaMcpTailscale = new k8s.core.v1.Service("grafana-mcp-tailscale", {
   },
 }, { dependsOn: [grafanaMcp] });
 
-// --- Gitea (self-hosted Git) ---
-
-const giteaNs = new k8s.core.v1.Namespace("gitea", {
-  metadata: { name: "gitea" },
-});
-
-const giteaAdminUser = config.requireSecret("giteaAdminUser");
-const giteaAdminPassword = config.requireSecret("giteaAdminPassword");
-const giteaPvcSize = config.get("giteaPvcSize") ?? "100Gi";
-
-const gitea = new k8s.helm.v4.Chart("gitea", {
-  namespace: giteaNs.metadata.name,
-  chart: "oci://docker.gitea.com/charts/gitea",
-  version: "12.5.0",
-  values: {
-    global: {
-      storageClass: "synology-csi-iscsi-retain",
-    },
-    gitea: {
-      admin: {
-        username: giteaAdminUser,
-        password: giteaAdminPassword,
-        email: "gitea@local.domain",
-      },
-    },
-    persistence: {
-      enabled: true,
-      size: giteaPvcSize,
-    },
-    "postgresql-ha": {
-      enabled: true,
-      persistence: {
-        enabled: true,
-        size: giteaPvcSize,
-      },
-    },
-    service: {
-      http: {
-        type: "ClusterIP",
-        port: 3000,
-      },
-      ssh: {
-        type: "ClusterIP",
-        port: 22,
-      },
-    },
-  },
-}, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
-
-// Tailscale-exposed services for Gitea
-const giteaTailscaleHttp = new k8s.core.v1.Service("gitea-tailscale-http", {
-  metadata: {
-    name: "gitea-tailscale-http",
-    namespace: giteaNs.metadata.name,
-    annotations: {
-      "tailscale.com/hostname": "gitea",
-    },
-  },
-  spec: {
-    type: "LoadBalancer",
-    loadBalancerClass: "tailscale",
-    selector: {
-      "app.kubernetes.io/name": "gitea",
-      "app.kubernetes.io/instance": "gitea",
-    },
-    ports: [{
-      name: "http",
-      port: 80,
-      targetPort: 3000,
-    }],
-  },
-});
-
-const giteaTailscaleSsh = new k8s.core.v1.Service("gitea-tailscale-ssh", {
-  metadata: {
-    name: "gitea-tailscale-ssh",
-    namespace: giteaNs.metadata.name,
-    annotations: {
-      "tailscale.com/hostname": "gitea-ssh",
-    },
-  },
-  spec: {
-    type: "LoadBalancer",
-    loadBalancerClass: "tailscale",
-    selector: {
-      "app.kubernetes.io/name": "gitea",
-      "app.kubernetes.io/instance": "gitea",
-    },
-    ports: [{
-      name: "ssh",
-      port: 22,
-      targetPort: 22,
-    }],
-  },
-});
-
 // Exports
 export const operatorNamespace = ns.metadata.name;
 export const synologyCsiNamespace = synologyNs.metadata.name;
@@ -759,6 +667,3 @@ export const grafanaEndpoint = "grafana";
 export const alloyOtlpGrpcEndpoint = "alloy-otlp-grpc:4317";
 export const alloyOtlpHttpEndpoint = "alloy-otlp-http:4318";
 export const grafanaMcpEndpoint = "grafana-mcp";
-export const giteaNamespace = giteaNs.metadata.name;
-export const giteaEndpoint = "gitea";
-export const giteaSshEndpoint = "gitea-ssh";
