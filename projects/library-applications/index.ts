@@ -29,6 +29,49 @@ const ignoreK8sDrift = [(args: any) => {
   return undefined;
 }];
 
+// Fix Agenta services path routing: the chart's entrypoints/main.py creates
+// FastAPI() without root_path, so the /services prefix from the ingress is
+// never stripped. The API got this right (FastAPI(root_path="/api")), but the
+// services app didn't. We inject a tiny ASGI wrapper via ConfigMap that strips
+// the prefix before requests hit the app.
+const stripServicesPrefix = [(args: any) => {
+  if (args.type === "kubernetes:apps/v1:Deployment" &&
+      args.props?.metadata?.labels?.["app.kubernetes.io/component"] === "services") {
+    const spec = args.props.spec.template.spec;
+    // Add the ConfigMap volume
+    spec.volumes = [...(spec.volumes || []), {
+      name: "services-wrapper",
+      configMap: { name: "agenta-services-wrapper" },
+    }];
+    // Patch the services container
+    for (const c of spec.containers) {
+      if (c.name === "services") {
+        // Mount the wrapper script into the app directory
+        c.volumeMounts = [...(c.volumeMounts || []), {
+          name: "services-wrapper",
+          mountPath: "/app/services_wrapper.py",
+          subPath: "services_wrapper.py",
+        }];
+        // Swap the gunicorn entrypoint to load the wrapper instead
+        c.command = c.command.map((arg: string) =>
+          arg === "entrypoints.main:app" ? "services_wrapper:app" : arg
+        );
+        // The SDK auth middleware calls AGENTA_API_URL to verify credentials.
+        // The default (global.apiUrl) is the external Tailscale URL, which
+        // hairpins out of the cluster and back — flaky and slow. Rewrite to
+        // use the internal cluster service for server-to-server auth.
+        for (const e of c.env || []) {
+          if (e.name === "AGENTA_API_URL") {
+            e.value = "http://agenta-api:8000/api";
+          }
+        }
+      }
+    }
+    return { props: args.props, opts: args.opts };
+  }
+  return undefined;
+}];
+
 // --- Gitea (self-hosted Git) ---
 
 const giteaNs = new k8s.core.v1.Namespace("gitea", {
@@ -166,6 +209,37 @@ const agentaPgauthSecret = new k8s.core.v1.Secret("agenta-pgauth", {
   },
 });
 
+// ASGI wrapper that strips the /services path prefix before forwarding to
+// the real app. Necessary because entrypoints/main.py creates FastAPI()
+// without root_path — upstream bug in the Agenta Helm chart.
+const servicesWrapper = new k8s.core.v1.ConfigMap("agenta-services-wrapper", {
+  metadata: {
+    name: "agenta-services-wrapper",
+    namespace: agentaNs.metadata.name,
+  },
+  data: {
+    "services_wrapper.py": `\
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+class StripPrefix:
+    """ASGI middleware that strips a path prefix before forwarding."""
+    def __init__(self, app: ASGIApp, prefix: str) -> None:
+        self.app = app
+        self.prefix = prefix
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path.startswith(self.prefix):
+                scope = dict(scope, path=path[len(self.prefix):] or "/")
+        await self.app(scope, receive, send)
+
+from entrypoints.main import app as _app
+app = StripPrefix(_app, "/services")
+`,
+  },
+});
+
 const agenta = new k8s.helm.v4.Chart("agenta", {
   namespace: agentaNs.metadata.name,
   chart: "./charts/agenta/hosting/helm/agenta-oss",
@@ -174,9 +248,9 @@ const agenta = new k8s.helm.v4.Chart("agenta", {
     // produces "agenta-agenta-oss" (release-chartname). Pin it to just "agenta".
     fullnameOverride: "agenta",
     global: {
-      webUrl: "https://agenta",
-      apiUrl: "https://agenta/api",
-      servicesUrl: "https://agenta/services",
+      webUrl: "https://agenta.vaquita-carp.ts.net",
+      apiUrl: "https://agenta.vaquita-carp.ts.net/api",
+      servicesUrl: "https://agenta.vaquita-carp.ts.net/services",
     },
     secrets: {
       agentaAuthKey: agentaAuthKey,
@@ -238,7 +312,7 @@ const agenta = new k8s.helm.v4.Chart("agenta", {
       enabled: false,
     },
   },
-}, { dependsOn: [agentaSecret, agentaPgauthSecret], transforms: ignoreK8sDrift });
+}, { dependsOn: [agentaSecret, agentaPgauthSecret, servicesWrapper], transforms: [...ignoreK8sDrift, ...stripServicesPrefix] });
 
 // Alembic migration job — another Helm hook that Pulumi skips.
 // Runs the DB schema migrations that create tables (users, etc.)
