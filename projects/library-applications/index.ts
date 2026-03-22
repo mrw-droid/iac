@@ -121,30 +121,53 @@ const gitea = new k8s.helm.v4.Chart("gitea", {
   },
 }, { transforms: ignoreK8sDrift });
 
-// Gitea HTTP stays as LB Service — gitea-http is headless (ClusterIP: None),
-// which Tailscale Ingress can't route to.
-const giteaTailscaleHttp = new k8s.core.v1.Service("gitea-tailscale-http", {
+// The chart's gitea-http service is headless (ClusterIP: None), which Tailscale
+// Ingress can't route to. Create a non-headless ClusterIP service for the Ingress backend.
+const giteaClusterIp = new k8s.core.v1.Service("gitea-clusterip", {
   metadata: {
-    name: "gitea-tailscale-http",
+    name: "gitea-clusterip",
     namespace: giteaNs.metadata.name,
-    annotations: {
-      "tailscale.com/hostname": "gitea",
-    },
   },
   spec: {
-    type: "LoadBalancer",
-    loadBalancerClass: "tailscale",
+    type: "ClusterIP",
     selector: {
       "app.kubernetes.io/name": "gitea",
       "app.kubernetes.io/instance": "gitea",
     },
     ports: [{
       name: "http",
-      port: 80,
+      port: 3000,
       targetPort: 3000,
     }],
   },
 });
+
+// Tailscale Ingress for Gitea — auto-provisions LE certs
+const giteaIngress = new k8s.networking.v1.Ingress("gitea-tailscale", {
+  metadata: {
+    name: "gitea-tailscale",
+    namespace: giteaNs.metadata.name,
+  },
+  spec: {
+    ingressClassName: "tailscale",
+    tls: [{ hosts: ["gitea"] }],
+    rules: [{
+      host: "gitea",
+      http: {
+        paths: [{
+          path: "/",
+          pathType: "Prefix",
+          backend: {
+            service: {
+              name: "gitea-clusterip",
+              port: { number: 3000 },
+            },
+          },
+        }],
+      },
+    }],
+  },
+}, { dependsOn: [gitea, giteaClusterIp] });
 
 const giteaTailscaleSsh = new k8s.core.v1.Service("gitea-tailscale-ssh", {
   metadata: {
@@ -164,7 +187,7 @@ const giteaTailscaleSsh = new k8s.core.v1.Service("gitea-tailscale-ssh", {
     ports: [{
       name: "ssh",
       port: 22,
-      targetPort: 22,
+      targetPort: 2222,
     }],
   },
 });
@@ -179,7 +202,7 @@ const agentaAuthKey = config.requireSecret("agentaAuthKey");
 const agentaCryptKey = config.requireSecret("agentaCryptKey");
 const agentaPostgresPassword = config.requireSecret("agentaPostgresPassword");
 const anthropicApiKey = config.requireSecret("anthropicApiKey");
-const agentaImageTag = config.get("agentaImageTag") ?? "v0.94.5";
+const agentaImageTag = config.get("agentaImageTag") ?? "v0.94.8";
 
 // All Agenta images are amd64-only (supercronic, API workers, etc.)
 const amd64NodeSelector = { "kubernetes.io/arch": "amd64" };
@@ -263,6 +286,11 @@ const agenta = new k8s.helm.v4.Chart("agenta", {
     api: {
       image: { tag: agentaImageTag },
       nodeSelector: amd64NodeSelector,
+      env: {
+        ALEMBIC_AUTO_MIGRATIONS: "true",
+        ALEMBIC_CFG_PATH_CORE: "/app/oss/databases/postgres/migrations/core/alembic.ini",
+        ALEMBIC_CFG_PATH_TRACING: "/app/oss/databases/postgres/migrations/tracing/alembic.ini",
+      },
     },
     web: {
       image: { tag: agentaImageTag },
@@ -282,7 +310,7 @@ const agenta = new k8s.helm.v4.Chart("agenta", {
       enabled: false,
     },
     alembic: {
-      nodeSelector: amd64NodeSelector,
+      enabled: false,
     },
     supertokens: {
       nodeSelector: amd64NodeSelector,
@@ -313,74 +341,6 @@ const agenta = new k8s.helm.v4.Chart("agenta", {
     },
   },
 }, { dependsOn: [agentaSecret, agentaPgauthSecret, servicesWrapper], transforms: [...ignoreK8sDrift, ...stripServicesPrefix] });
-
-// Alembic migration job — another Helm hook that Pulumi skips.
-// Runs the DB schema migrations that create tables (users, etc.)
-const alembicJob = new k8s.batch.v1.Job("agenta-alembic", {
-  metadata: {
-    name: "agenta-alembic",
-    namespace: agentaNs.metadata.name,
-    labels: {
-      "app.kubernetes.io/component": "alembic",
-    },
-  },
-  spec: {
-    activeDeadlineSeconds: 600,
-    backoffLimit: 3,
-    ttlSecondsAfterFinished: 300,
-    template: {
-      metadata: {
-        labels: {
-          "app.kubernetes.io/component": "alembic",
-        },
-      },
-      spec: {
-        restartPolicy: "Never",
-        nodeSelector: amd64NodeSelector,
-        initContainers: [{
-          name: "wait-for-postgres",
-          image: "busybox:1.36",
-          command: ["sh", "-c", `
-            echo "Waiting for PostgreSQL at agenta-postgresql:5432..."
-            until nc -z agenta-postgresql 5432; do
-              echo "PostgreSQL not ready, retrying in 2s..."
-              sleep 2
-            done
-            echo "PostgreSQL is ready."
-          `],
-        }],
-        containers: [{
-          name: "alembic",
-          image: pulumi.interpolate`ghcr.io/agenta-ai/agenta-api:${agentaImageTag}`,
-          command: ["sh", "-c", "python -m oss.databases.postgres.migrations.runner"],
-          env: [
-            { name: "AGENTA_LICENSE", value: "oss" },
-            { name: "POSTGRES_PASSWORD", valueFrom: { secretKeyRef: { name: "agenta", key: "POSTGRES_PASSWORD" } } },
-            { name: "AGENTA_AUTH_KEY", valueFrom: { secretKeyRef: { name: "agenta", key: "AGENTA_AUTH_KEY" } } },
-            { name: "AGENTA_CRYPT_KEY", valueFrom: { secretKeyRef: { name: "agenta", key: "AGENTA_CRYPT_KEY" } } },
-            { name: "POSTGRES_URI_CORE", value: "postgresql+asyncpg://agenta:$(POSTGRES_PASSWORD)@agenta-postgresql:5432/agenta_oss_core" },
-            { name: "POSTGRES_URI_TRACING", value: "postgresql+asyncpg://agenta:$(POSTGRES_PASSWORD)@agenta-postgresql:5432/agenta_oss_tracing" },
-            { name: "POSTGRES_URI_SUPERTOKENS", value: "postgresql://agenta:$(POSTGRES_PASSWORD)@agenta-postgresql:5432/agenta_oss_supertokens" },
-            { name: "REDIS_URI", value: "redis://agenta-redis-volatile:6379/0" },
-            { name: "REDIS_URI_VOLATILE", value: "redis://agenta-redis-volatile:6379/0" },
-            { name: "REDIS_URI_DURABLE", value: "redis://agenta-redis-durable:6381/0" },
-            { name: "SUPERTOKENS_CONNECTION_URI", value: "http://agenta-supertokens:3567" },
-            { name: "AGENTA_WEB_URL", value: "http://agenta" },
-            { name: "AGENTA_API_URL", value: "http://agenta/api" },
-            { name: "AGENTA_SERVICES_URL", value: "http://agenta/services" },
-            { name: "ALEMBIC_AUTO_MIGRATIONS", value: "true" },
-            { name: "ALEMBIC_CFG_PATH_CORE", value: "/app/oss/databases/postgres/migrations/core/alembic.ini" },
-            { name: "ALEMBIC_CFG_PATH_TRACING", value: "/app/oss/databases/postgres/migrations/tracing/alembic.ini" },
-          ],
-          resources: {
-            requests: { cpu: "100m", memory: "256Mi" },
-            limits: { memory: "512Mi" },
-          },
-        }],
-      },
-    },
-  },
-}, { dependsOn: [agenta, agentaSecret] });
 
 // Tailscale Ingress for Agenta — auto-provisions LE certs, handles path routing
 const agentaIngress = new k8s.networking.v1.Ingress("agenta-tailscale", {
