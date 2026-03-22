@@ -90,11 +90,22 @@ const gitea = new k8s.helm.v4.Chart("gitea", {
     global: {
       storageClass: "synology-csi-iscsi-retain",
     },
+    strategy: {
+      type: "Recreate",
+    },
     gitea: {
       admin: {
         username: giteaAdminUser,
         password: giteaAdminPassword,
         email: "gitea@local.domain",
+      },
+      config: {
+        server: {
+          DOMAIN: "gitea.vaquita-carp.ts.net",
+          ROOT_URL: "https://gitea.vaquita-carp.ts.net",
+          SSH_DOMAIN: "gitea-ssh.vaquita-carp.ts.net",
+          SSH_PORT: "22",
+        },
       },
     },
     persistence: {
