@@ -5,7 +5,8 @@
     "@types/node": "^20"
   },
   "dependencies": {
-    "@pulumi/pulumi": "^3",
-    "@pulumi/kubernetes": "^4"
+    "@pulumi/docker-build": "^0.0.15",
+    "@pulumi/kubernetes": "^4",
+    "@pulumi/pulumi": "^3"
   }
 }

@@ -1,5 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as k8s from "@pulumi/kubernetes";
+import * as dockerBuild from "@pulumi/docker-build";
 
 const config = new pulumi.Config();
 
@@ -402,9 +403,115 @@ const agentaIngress = new k8s.networking.v1.Ingress("agenta-tailscale", {
   },
 }, { dependsOn: [agenta] });
 
+// --- Flatline (AI agent server — CNPG Postgres) ---
+
+const flatlineNs = new k8s.core.v1.Namespace("flatline", {
+  metadata: { name: "flatline" },
+});
+
+const minioAccessKey = config.requireSecret("minioAccessKey");
+const minioSecretKey = config.requireSecret("minioSecretKey");
+const flatlineDbInstances = parseInt(config.get("flatlineDbInstances") ?? "1");
+const flatlineDbSize = config.get("flatlineDbSize") ?? "20Gi";
+const giteaRegistryUser = config.requireSecret("giteaRegistryUser");
+const giteaRegistryPassword = config.requireSecret("giteaRegistryPassword");
+const giteaRegistryHost = config.get("giteaRegistryHost") ?? "gitea.vaquita-carp.ts.net";
+
+// Build and push the CNPG + pgvector image to Gitea's container registry
+const cnpgPgvectorImage = new dockerBuild.Image("cnpg-pgvector", {
+  tags: [pulumi.interpolate`${giteaRegistryHost}/flatline/cnpg-pgvector:17-bookworm`],
+  context: { location: "./images/cnpg-pgvector" },
+  platforms: [dockerBuild.Platform.Linux_amd64],
+  push: true,
+  registries: [{
+    address: giteaRegistryHost,
+    username: giteaRegistryUser,
+    password: giteaRegistryPassword,
+  }],
+});
+
+// MinIO credentials for CNPG backups — must live in the same namespace as the Cluster
+const flatlineMinioCreds = new k8s.core.v1.Secret("flatline-minio-creds", {
+  metadata: {
+    name: "minio-creds",
+    namespace: flatlineNs.metadata.name,
+  },
+  stringData: {
+    ACCESS_KEY_ID: minioAccessKey,
+    ACCESS_SECRET_KEY: minioSecretKey,
+  },
+});
+
+// CNPG Cluster: single Postgres instance with pgvector, backups to MinIO
+const flatlineDb = new k8s.apiextensions.CustomResource("flatline-db", {
+  apiVersion: "postgresql.cnpg.io/v1",
+  kind: "Cluster",
+  metadata: {
+    name: "flatline-db",
+    namespace: flatlineNs.metadata.name,
+  },
+  spec: {
+    instances: flatlineDbInstances,
+    imageName: cnpgPgvectorImage.ref,
+    bootstrap: {
+      initdb: {
+        database: "flatline",
+        owner: "flatline",
+        postInitSQL: [
+          "CREATE EXTENSION IF NOT EXISTS vector;",
+        ],
+      },
+    },
+    storage: {
+      size: flatlineDbSize,
+      storageClass: "synology-csi-iscsi-retain",
+    },
+    backup: {
+      barmanObjectStore: {
+        destinationPath: "s3://cnpg-backups/flatline-db/",
+        endpointURL: "http://minio.minio.svc.cluster.local:9000",
+        s3Credentials: {
+          accessKeyId:     { name: "minio-creds", key: "ACCESS_KEY_ID" },
+          secretAccessKey: { name: "minio-creds", key: "ACCESS_SECRET_KEY" },
+        },
+        wal: {
+          compression: "gzip",
+          maxParallel: 2,
+        },
+        data: {
+          compression: "gzip",
+          immediateCheckpoint: true,
+        },
+      },
+      retentionPolicy: "14d",
+    },
+    monitoring: {
+      enablePodMonitor: false,
+    },
+  },
+}, { dependsOn: [flatlineMinioCreds, cnpgPgvectorImage] });
+
+// Daily base backup at 2 AM UTC
+const flatlineBackup = new k8s.apiextensions.CustomResource("flatline-db-daily-backup", {
+  apiVersion: "postgresql.cnpg.io/v1",
+  kind: "ScheduledBackup",
+  metadata: {
+    name: "flatline-db-daily",
+    namespace: flatlineNs.metadata.name,
+  },
+  spec: {
+    schedule: "0 2 * * *",
+    backupOwnerReference: "self",
+    cluster: { name: "flatline-db" },
+    method: "barmanObjectStore",
+  },
+}, { dependsOn: [flatlineDb] });
+
 // Exports
 export const giteaNamespace = giteaNs.metadata.name;
 export const giteaEndpoint = "gitea";
 export const giteaSshEndpoint = "gitea-ssh";
 export const agentaNamespace = agentaNs.metadata.name;
 export const agentaEndpoint = "https://agenta";
+export const flatlineNamespace = flatlineNs.metadata.name;
+export const flatlineDbEndpoint = "flatline-db-rw.flatline.svc.cluster.local:5432";
