@@ -1,0 +1,24 @@
+[Unit]
+Description=Murderbot k3s QEMU guest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mrw
+WorkingDirectory=/home/mrw/Workspace/the-library
+ExecStart=/usr/bin/qemu-system-x86_64 \
+  -enable-kvm \
+  -cpu host \
+  -smp 32 \
+  -m 168G \
+  -drive file=murderbot-k8s.qcow2,format=qcow2,if=virtio \
+  -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
+  -device virtio-net-pci,netdev=net0 \
+  -nographic \
+  -serial mon:stdio
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
