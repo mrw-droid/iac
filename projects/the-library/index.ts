@@ -250,6 +250,86 @@ const minioTailscaleConsole = new k8s.core.v1.Service("minio-tailscale-console",
   },
 });
 
+// --- cert-manager (TLS certificate management) ---
+// Required by CNPG's Barman Cloud plugin for mTLS between operator and plugin.
+
+const certManagerNs = new k8s.core.v1.Namespace("cert-manager", {
+  metadata: { name: "cert-manager" },
+});
+
+const certManager = new k8s.helm.v4.Chart("cert-manager", {
+  namespace: certManagerNs.metadata.name,
+  chart: "cert-manager",
+  version: "1.20.0",
+  repositoryOpts: {
+    repo: "https://charts.jetstack.io",
+  },
+  values: {
+    crds: {
+      enabled: true,
+    },
+  },
+}, { transforms: ignoreK8sDrift });
+
+// --- CloudNativePG Operator (Postgres on Kubernetes) ---
+
+const cnpgNs = new k8s.core.v1.Namespace("cnpg-system", {
+  metadata: { name: "cnpg-system" },
+});
+
+const cnpgOperator = new k8s.helm.v4.Chart("cnpg-operator", {
+  namespace: cnpgNs.metadata.name,
+  chart: "cloudnative-pg",
+  version: "0.27.1",
+  repositoryOpts: {
+    repo: "https://cloudnative-pg.github.io/charts",
+  },
+  values: {},
+}, { transforms: ignoreK8sDrift });
+
+// Barman Cloud plugin — handles backups to object storage (MinIO/S3/GCS).
+// In-tree barman support is deprecated and removed in CNPG 1.30.
+const barmanCloud = new k8s.helm.v4.Chart("barman-cloud", {
+  namespace: cnpgNs.metadata.name,
+  chart: "plugin-barman-cloud",
+  version: "0.5.0",
+  repositoryOpts: {
+    repo: "https://cloudnative-pg.github.io/charts",
+  },
+  values: {},
+}, { dependsOn: [cnpgOperator, certManager], transforms: ignoreK8sDrift });
+
+// Bootstrap Job: create the cnpg-backups bucket in MinIO.
+// Uses mc --ignore-existing so it's idempotent. The Job self-deletes after
+// completion (ttlSecondsAfterFinished) to avoid Pulumi drift on re-runs.
+const cnpgBackupBucket = new k8s.batch.v1.Job("minio-create-cnpg-bucket", {
+  metadata: {
+    name: "minio-create-cnpg-bucket",
+    namespace: minioNs.metadata.name,
+  },
+  spec: {
+    ttlSecondsAfterFinished: 120,
+    template: {
+      spec: {
+        restartPolicy: "OnFailure",
+        containers: [{
+          name: "mc",
+          image: "minio/mc:latest",
+          command: ["/bin/sh", "-c"],
+          args: [
+            "mc alias set minio http://minio.minio.svc.cluster.local:9000 \"$ACCESS_KEY\" \"$SECRET_KEY\" && mc mb --ignore-existing minio/cnpg-backups",
+          ],
+          env: [
+            { name: "ACCESS_KEY", value: minioRootUser },
+            { name: "SECRET_KEY", value: minioRootPassword },
+          ],
+        }],
+      },
+    },
+    backoffLimit: 3,
+  },
+}, { dependsOn: [minio] });
+
 // --- Observability Stack (Loki, Prometheus, Tempo, Grafana, Alloy) ---
 
 const monitoringNs = new k8s.core.v1.Namespace("monitoring", {
@@ -310,6 +390,38 @@ const loki = new k8s.helm.v4.Chart("loki", {
   },
 }, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
 
+// Prometheus scrape configs for CNPG operator and managed Postgres clusters.
+// The community chart doesn't support PodMonitor CRDs — use extraScrapeConfigs
+// with kubernetes pod SD to discover CNPG pods by label.
+const cnpgScrapeConfigs = `\
+- job_name: cnpg-operator
+  kubernetes_sd_configs:
+    - role: pod
+      namespaces:
+        names: ['cnpg-system']
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+      action: keep
+      regex: cloudnative-pg
+    - source_labels: [__meta_kubernetes_pod_container_port_number]
+      action: keep
+      regex: "8080"
+- job_name: cnpg-clusters
+  kubernetes_sd_configs:
+    - role: pod
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_label_cnpg_io_cluster]
+      action: keep
+      regex: .+
+    - source_labels: [__meta_kubernetes_pod_container_port_number]
+      action: keep
+      regex: "9187"
+    - source_labels: [__meta_kubernetes_pod_label_cnpg_io_cluster]
+      target_label: cluster
+    - source_labels: [__meta_kubernetes_namespace]
+      target_label: namespace
+`;
+
 // Prometheus — metrics (lean: server only, no alertmanager/pushgateway)
 const prometheus = new k8s.helm.v4.Chart("prometheus", {
   namespace: monitoringNs.metadata.name,
@@ -338,6 +450,7 @@ const prometheus = new k8s.helm.v4.Chart("prometheus", {
         "web.enable-remote-write-receiver",
       ],
     },
+    extraScrapeConfigs: cnpgScrapeConfigs,
   },
 }, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
 
@@ -667,3 +780,4 @@ export const grafanaEndpoint = "grafana";
 export const alloyOtlpGrpcEndpoint = "alloy-otlp-grpc:4317";
 export const alloyOtlpHttpEndpoint = "alloy-otlp-http:4318";
 export const grafanaMcpEndpoint = "grafana-mcp";
+export const cnpgNamespace = cnpgNs.metadata.name;
