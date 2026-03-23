@@ -507,6 +507,30 @@ const flatlineBackup = new k8s.apiextensions.CustomResource("flatline-db-daily-b
   },
 }, { dependsOn: [flatlineDb] });
 
+// Tailscale LoadBalancer for Postgres — TCP protocol, so LoadBalancer not Ingress
+const flatlineDbTailscale = new k8s.core.v1.Service("flatline-db-tailscale", {
+  metadata: {
+    name: "flatline-db-tailscale",
+    namespace: flatlineNs.metadata.name,
+    annotations: {
+      "tailscale.com/hostname": "flatline-db",
+    },
+  },
+  spec: {
+    type: "LoadBalancer",
+    loadBalancerClass: "tailscale",
+    selector: {
+      "cnpg.io/cluster": "flatline-db",
+      role: "primary",
+    },
+    ports: [{
+      name: "postgres",
+      port: 5432,
+      targetPort: 5432,
+    }],
+  },
+}, { dependsOn: [flatlineDb] });
+
 // Exports
 export const giteaNamespace = giteaNs.metadata.name;
 export const giteaEndpoint = "gitea";
@@ -514,4 +538,4 @@ export const giteaSshEndpoint = "gitea-ssh";
 export const agentaNamespace = agentaNs.metadata.name;
 export const agentaEndpoint = "https://agenta";
 export const flatlineNamespace = flatlineNs.metadata.name;
-export const flatlineDbEndpoint = "flatline-db-rw.flatline.svc.cluster.local:5432";
+export const flatlineDbEndpoint = "flatline-db.vaquita-carp.ts.net:5432";
