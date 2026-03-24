@@ -1,0 +1,13 @@
+[connection]
+id=tap0
+uuid=1bb988c7-9234-4134-87c3-5d860b791879
+type=tun
+controller=br0
+interface-name=tap0
+port-type=bridge
+
+[tun]
+mode=2
+owner=1000
+
+[bridge-port]
