@@ -203,52 +203,59 @@ const minio = new k8s.helm.v4.Chart("minio", {
   },
 }, { dependsOn: [synologyCsi], transforms: ignoreK8sDrift });
 
-// Tailscale-exposed services for MinIO (chart doesn't support loadBalancerClass)
-const minioTailscaleApi = new k8s.core.v1.Service("minio-tailscale-api", {
+// Tailscale Ingress for MinIO API (HTTPS via LE auto-provisioned certs)
+const minioIngress = new k8s.networking.v1.Ingress("minio-tailscale", {
   metadata: {
-    name: "minio-tailscale-api",
+    name: "minio-tailscale",
     namespace: minioNs.metadata.name,
-    annotations: {
-      "tailscale.com/hostname": "minio",
-    },
   },
   spec: {
-    type: "LoadBalancer",
-    loadBalancerClass: "tailscale",
-    selector: {
-      app: "minio",
-      release: "minio",
-    },
-    ports: [{
-      name: "http",
-      port: 80,
-      targetPort: 9000,
+    ingressClassName: "tailscale",
+    tls: [{ hosts: ["minio"] }],
+    rules: [{
+      host: "minio",
+      http: {
+        paths: [{
+          path: "/",
+          pathType: "Prefix",
+          backend: {
+            service: {
+              name: "minio",
+              port: { number: 9000 },
+            },
+          },
+        }],
+      },
     }],
   },
-});
+}, { dependsOn: [minio] });
 
-const minioTailscaleConsole = new k8s.core.v1.Service("minio-tailscale-console", {
+// Tailscale Ingress for MinIO Console (HTTPS via LE auto-provisioned certs)
+const minioConsoleIngress = new k8s.networking.v1.Ingress("minio-console-tailscale", {
   metadata: {
-    name: "minio-tailscale-console",
+    name: "minio-console-tailscale",
     namespace: minioNs.metadata.name,
-    annotations: {
-      "tailscale.com/hostname": "minio-console",
-    },
   },
   spec: {
-    type: "LoadBalancer",
-    loadBalancerClass: "tailscale",
-    selector: {
-      app: "minio",
-      release: "minio",
-    },
-    ports: [{
-      name: "http",
-      port: 80,
-      targetPort: 9001,
+    ingressClassName: "tailscale",
+    tls: [{ hosts: ["minio-console"] }],
+    rules: [{
+      host: "minio-console",
+      http: {
+        paths: [{
+          path: "/",
+          pathType: "Prefix",
+          backend: {
+            service: {
+              name: "minio-console",
+              port: { number: 9001 },
+            },
+          },
+        }],
+      },
     }],
   },
-});
+}, { dependsOn: [minio] });
 
 // --- cert-manager (TLS certificate management) ---
 // Required by CNPG's Barman Cloud plugin for mTLS between operator and plugin.

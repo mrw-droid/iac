@@ -107,6 +107,9 @@ const gitea = new k8s.helm.v4.Chart("gitea", {
           SSH_DOMAIN: "gitea-ssh.vaquita-carp.ts.net",
           SSH_PORT: "22",
         },
+        ui: {
+          PREFERRED_TIMESTAMP_TENSE: "absolute",
+        },
       },
     },
     persistence: {
