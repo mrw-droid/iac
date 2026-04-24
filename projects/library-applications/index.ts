@@ -110,6 +110,9 @@ const gitea = new k8s.helm.v4.Chart("gitea", {
         ui: {
           PREFERRED_TIMESTAMP_TENSE: "absolute",
         },
+        time: {
+          FORMAT: "RFC3339",
+        },
       },
     },
     persistence: {
